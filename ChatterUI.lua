@@ -173,10 +173,39 @@ local function createMultiLineEditBox(
         scroll:SetVerticalScroll(value)
     end)
 
-    -- Update scrollbar when text changes
-    box:SetScript("OnTextChanged", function()
-        scrollbar:SetValue(0)
+    -- Update scrollbar when text changes. Text set by the
+    -- addon starts from the top; typing stays where it is.
+    box:SetScript("OnTextChanged", function(self, userInput)
+        if not userInput then
+            scrollbar:SetValue(0)
+        end
         updateScrollbar()
+        if userInput and self.onUserText then
+            self.onUserText(self)
+        end
+    end)
+    -- Keep the cursor in view while typing in a long text.
+    box:SetScript("OnCursorChanged", function(self, _, y, _, height)
+        if not self:HasFocus() then return end
+        updateScrollbar()
+        local top = -y
+        local bottom = top + height
+        local current = scroll:GetVerticalScroll()
+        local view = scroll:GetHeight()
+        if top < current then
+            scrollbar:SetValue(math.max(0, top))
+        elseif bottom > current + view then
+            scrollbar:SetValue(bottom - view)
+        end
+    end)
+    box:SetScript("OnEscapePressed", function(self)
+        self:ClearFocus()
+    end)
+    -- A click anywhere in the frame reaches the text, not only
+    -- on the lines already written.
+    holder:EnableMouse(true)
+    holder:SetScript("OnMouseDown", function()
+        if box.editable then box:SetFocus() end
     end)
     box:SetScript("OnSizeChanged", updateScrollbar)
     scroll:HookScript("OnSizeChanged", updateScrollbar)
@@ -197,7 +226,7 @@ function Chatter:BuildEditor(panel, section)
         storyOnly and "Background Stories" or "Bot Traits", 16, -16)
     title:SetFontObject(GameFontNormalLarge)
     local hint = createLabel(panel,
-        storyOnly and "Select a bot to read or regenerate its story."
+        storyOnly and "Select a bot to read, edit or regenerate its story."
         or "Click a name to edit. Check bots to forget their memories.", 16, -40)
     hint:SetFontObject(GameFontHighlightSmall)
     hint:SetPoint("TOPRIGHT", panel, "TOPRIGHT", -16, -40)
@@ -325,12 +354,25 @@ function Chatter:BuildEditor(panel, section)
             createLabel(content, "Background Story", 0, -236)
         end
         panel.backstory = createMultiLineEditBox(content, 0, -254, 200, 158)
+        -- Editable once a profile is loaded; Chatter:UpdateStoryControls
+        -- switches it on and off.
         panel.backstory:EnableMouse(false)
+        panel.backstory.onUserText = function()
+            Chatter:StoryTyped(panel)
+        end
         panel.regenStoryBtn = button(content, "Regenerate Story", 136, function()
             Chatter:RegenBackstory()
         end)
         panel.regenStoryBtn:SetPoint("TOPLEFT", content, "TOPLEFT", 0, -424)
         panel.regenStoryBtn:Disable()
+        panel.saveStoryBtn = button(content, "Save Story", 110, function()
+            Chatter:SaveStory()
+        end)
+        panel.saveStoryBtn:SetPoint("LEFT", panel.regenStoryBtn, "RIGHT", 8, 0)
+        panel.saveStoryBtn:Disable()
+        panel.storyCount = content:CreateFontString(nil, "OVERLAY",
+            "GameFontHighlightSmall")
+        panel.storyCount:SetPoint("LEFT", panel.saveStoryBtn, "RIGHT", 8, 0)
         if storyOnly then
             -- The story fills the viewport; its own scrollbar handles long text.
             local holder = panel.backstory:GetParent()
@@ -341,6 +383,14 @@ function Chatter:BuildEditor(panel, section)
             panel.regenStoryBtn:SetParent(panel)
             panel.regenStoryBtn:SetPoint("BOTTOMRIGHT", panel,
                 "BOTTOMRIGHT", -16, 44)
+            panel.saveStoryBtn:ClearAllPoints()
+            panel.saveStoryBtn:SetParent(panel)
+            panel.saveStoryBtn:SetPoint("RIGHT", panel.regenStoryBtn,
+                "LEFT", -8, 0)
+            panel.storyCount:ClearAllPoints()
+            panel.storyCount:SetParent(panel)
+            panel.storyCount:SetPoint("RIGHT", panel.saveStoryBtn,
+                "LEFT", -8, 0)
         end
     end
 

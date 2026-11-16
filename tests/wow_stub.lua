@@ -31,6 +31,7 @@ local function newEditBox()
     function box:SetMaxLetters() end
     function box:SetAutoFocus() end
     function box:ClearFocus() end
+    function box:EnableMouse(flag) self.mouse = flag and true or false end
     return box
 end
 
@@ -62,8 +63,10 @@ local function newPanel(shown, section)
     end
 
     if section ~= "traits" then
-        p.backstory = newFontString()
+        p.backstory = newEditBox()
         p.regenStoryBtn = newButton()
+        p.saveStoryBtn = newButton()
+        p.storyCount = newFontString()
     end
 
     function p:IsShown() return self.shown end

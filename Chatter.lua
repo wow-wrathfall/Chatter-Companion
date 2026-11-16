@@ -6,11 +6,12 @@ Chatter.pendingRoster = nil
 Chatter.selectedGuid = nil
 Chatter.pendingProfileGuid = nil
 Chatter.pendingToneGuid = nil
-Chatter.tonePollElapsed = 0
 Chatter.tonePollRemaining = 0
 Chatter.pendingBackstoryGuid = nil
-Chatter.backstoryPollElapsed = 0
 Chatter.backstoryPollRemaining = 0
+-- Tone and backstory are both answered by the same `get`, so
+-- the two polls share one request clock.
+Chatter.pollElapsed = 0
 Chatter.sendQueue = {}
 Chatter.sendElapsed = 0
 Chatter.saveLocked = false
@@ -26,6 +27,23 @@ Chatter.uploadState = nil
 -- the server confirms the save so a rejection or a timeout
 -- can hand the edit back instead of losing it.
 Chatter.unsavedTraits = nil
+-- The story the server last sent for the selected bot.
+Chatter.loadedBackstory = nil
+-- A story the player has typed and the server has not taken
+-- yet: { guid, text }. It exists from the first keystroke
+-- until the server confirms it or the player picks a bot
+-- again, and while it exists nothing the server sends may
+-- replace the text in the story boxes.
+Chatter.storyEdit = nil
+-- Which save the open upload is, "traits" or "story". Each
+-- kind has its own acknowledgement, and one arriving late for
+-- an upload that was given up must not close a newer upload of
+-- the other kind.
+Chatter.uploadKind = nil
+-- Per bot, while a story generation this addon asked for may
+-- still be about to run: { remaining, replaced }. `replaced`
+-- is the story that was on record when it was asked for.
+Chatter.storyHolds = {}
 
 -- The client cuts an outgoing chat line at 255 characters.
 local MAX_CHAT_LENGTH = 255
@@ -40,6 +58,26 @@ local SEND_INTERVAL = 0.3
 -- long as it takes: a clock started earlier would be racing
 -- the send queue rather than measuring the server.
 local SAVE_LOCK_TIMEOUT = 20
+-- Seconds between `get` requests while generated text is
+-- awaited, and how long to keep asking before giving up.
+local POLL_INTERVAL = 2
+local POLL_TIMEOUT = 120
+-- Server limits: characters, not bytes.
+local MAX_STORY_CHARS = 1000
+-- The server accepts at most this many chunks per field.
+local MAX_CHUNKS = 64
+-- A queued generation job starts by clearing the stored story,
+-- so a story saved before it runs would be erased. Saving is
+-- therefore held after anything that queues a job, however the
+-- addon's own wait for the result ends, until the generated
+-- story is seen. If it never is, the hold lapses after this
+-- many seconds: the server stops handing out a job 120 seconds
+-- after it was queued, and a commit may land a little after
+-- the addon stopped waiting for it. That is a best effort, not
+-- a guarantee. A job already handed out can still be waiting
+-- its turn, and only the server could refuse to clear a story
+-- saved in the meantime.
+local STORY_HOLD = 150
 
 local function trim(value)
     if not value then
@@ -194,6 +232,7 @@ function Chatter:LockSave()
     self.saveLocked = true
     self.saveLockRemaining = 0
     self:SetSaveEnabled(false)
+    self:UpdateStoryControls()
 end
 
 -- The whole upload is out on the wire, so from here on
@@ -208,6 +247,7 @@ function Chatter:UnlockSave()
     self.saveLocked = false
     self.saveLockRemaining = 0
     self:UpdateSaveButton()
+    self:UpdateStoryControls()
 end
 
 function Chatter:HandleSaveLock(elapsed)
@@ -218,7 +258,7 @@ function Chatter:HandleSaveLock(elapsed)
     self.saveLockRemaining = self.saveLockRemaining - elapsed
     if self.saveLockRemaining <= 0 then
         self:AbortUpload(
-            "The server did not answer. Your traits are"
+            "The server did not answer. Your changes are"
                 .. " still here — save again to retry.",
             1, 0.82, 0
         )
@@ -240,13 +280,177 @@ function Chatter:AbortUpload(message, r, g, b)
     end
     self.uploadGuid = nil
     self.uploadState = nil
+    self.uploadKind = nil
     self:StopTonePoll()
     self:StopBackstoryPoll()
     self:RestoreUnsavedTraits()
+    self:RestoreStoryEdit()
     self:UnlockSave()
     if message then
         self:SetStatus(message, r, g, b)
     end
+end
+
+local function eachStoryPanel(self, fn)
+    if self.frame and self.frame.backstory then
+        fn(self.frame)
+    end
+    if self.storiesPanel and self.storiesPanel.backstory then
+        fn(self.storiesPanel)
+    end
+end
+
+-- Writes a story into both story boxes, as server text.
+function Chatter:ShowStory(text, r, g, b)
+    text = text or ""
+    eachStoryPanel(self, function(p)
+        -- Rewriting identical text would only throw the
+        -- reader back to the top of a long story.
+        if p.backstory:GetText() ~= text then
+            p.backstory:SetText(text)
+        end
+        p.backstory:SetTextColor(r or 0.7, g or 0.7, b or 0.7)
+    end)
+end
+
+-- The unsaved story for the selected bot, if there is one.
+function Chatter:GetStoryEdit()
+    local e = self.storyEdit
+    if e and e.guid == self.selectedGuid then
+        return e
+    end
+    return nil
+end
+
+-- Puts the story the player typed back into both boxes, so
+-- an abandoned save can be corrected and retried.
+function Chatter:RestoreStoryEdit()
+    local e = self:GetStoryEdit()
+    if e then
+        self:ShowStory(e.text, 1, 1, 1)
+    end
+end
+
+-- Called by the editor whenever the player types in a story
+-- box. Both boxes follow each other, and the text becomes an
+-- unsaved edit as soon as it differs from the server's story.
+function Chatter:StoryTyped(source)
+    if not self.selectedGuid or not source
+        or not source.backstory then
+        return
+    end
+    local text = source.backstory:GetText() or ""
+    eachStoryPanel(self, function(p)
+        if p ~= source then
+            p.backstory:SetText(text)
+        end
+        p.backstory:SetTextColor(1, 1, 1)
+    end)
+    if sanitizeInput(text) ~= (self.loadedBackstory or "") then
+        self.storyEdit = {guid = self.selectedGuid, text = text}
+    else
+        self.storyEdit = nil
+    end
+    self:UpdateStoryControls()
+end
+
+-- Starts (or restarts) the wait before a story may be saved
+-- for this bot. Called for everything that queues a story
+-- generation on the server.
+function Chatter:HoldStorySave(guid)
+    guid = tonumber(guid)
+    if not guid then
+        return
+    end
+    local hold = self.storyHolds[guid]
+    if hold then
+        -- Asked again before the first one finished: the
+        -- story being replaced is still the earlier one.
+        hold.remaining = STORY_HOLD
+    else
+        local replaced = nil
+        if guid == self.selectedGuid then
+            replaced = self.loadedBackstory
+        end
+        self.storyHolds[guid] = {
+            remaining = STORY_HOLD,
+            replaced = replaced,
+        }
+    end
+    self:UpdateStoryControls()
+end
+
+function Chatter:HandleStoryHolds(elapsed)
+    local released = false
+    for guid, hold in pairs(self.storyHolds) do
+        hold.remaining = hold.remaining - elapsed
+        if hold.remaining <= 0 then
+            self.storyHolds[guid] = nil
+            released = true
+        end
+    end
+    if released then
+        self:UpdateStoryControls()
+    end
+end
+
+-- Decides whether the story can be typed in and saved, and
+-- keeps the character counter current.
+function Chatter:UpdateStoryControls()
+    local edit = self:GetStoryEdit()
+    local idle = (
+        self.loadedTraits ~= nil
+        and self.loadedBackstory ~= nil
+        and not self.pendingProfileGuid
+        and not self.uploadState
+        and not self.saveLocked
+        and not self.forgetQueue
+    )
+    -- While a story is being generated the box shows a
+    -- placeholder, which is not text to edit. An edit that
+    -- already exists stays editable throughout.
+    local canEdit = idle and (
+        not self.pendingBackstoryGuid or edit ~= nil
+    )
+    -- Saving waits for a running generation to finish: the
+    -- worker begins by clearing the stored story, so a save
+    -- that lands first would be thrown away.
+    local canSave = (
+        idle and edit ~= nil and not self.pendingBackstoryGuid
+        and not self.storyHolds[self.selectedGuid or 0]
+    )
+    eachStoryPanel(self, function(p)
+        local box = p.backstory
+        box.editable = canEdit
+        if box.EnableMouse then
+            box:EnableMouse(canEdit)
+        end
+        if not canEdit and box.ClearFocus then
+            box:ClearFocus()
+        end
+        if p.saveStoryBtn then
+            if canSave then
+                p.saveStoryBtn:Enable()
+            else
+                p.saveStoryBtn:Disable()
+            end
+        end
+        if p.storyCount then
+            if edit then
+                local count = utf8len(sanitizeInput(edit.text))
+                p.storyCount:SetText(
+                    count .. "/" .. MAX_STORY_CHARS
+                )
+                if count > MAX_STORY_CHARS then
+                    p.storyCount:SetTextColor(1, 0.2, 0.2)
+                else
+                    p.storyCount:SetTextColor(0.7, 0.7, 0.7)
+                end
+            else
+                p.storyCount:SetText("")
+            end
+        end
+    end)
 end
 
 -- Puts the traits the player typed back into both editors so
@@ -270,7 +474,6 @@ end
 
 function Chatter:StopTonePoll()
     self.pendingToneGuid = nil
-    self.tonePollElapsed = 0
     self.tonePollRemaining = 0
 end
 
@@ -281,8 +484,8 @@ function Chatter:StartTonePoll(guid)
     end
 
     self.pendingToneGuid = guid
-    self.tonePollElapsed = 0
-    self.tonePollRemaining = 120
+    self.pollElapsed = 0
+    self.tonePollRemaining = POLL_TIMEOUT
 
     local function applyPlaceholder(panel)
         if not panel then return end
@@ -295,26 +498,61 @@ function Chatter:StartTonePoll(guid)
     applyPlaceholder(self.traitsPanel)
 end
 
-function Chatter:HandleTonePoll(elapsed)
-    if not self.pendingToneGuid then
+-- Drives both polls. Each `get` is answered with a PROFILE
+-- and a BACKSTORY line, so one request per interval serves
+-- whichever of the two is still awaited.
+function Chatter:HandlePolls(elapsed)
+    if not self.pendingToneGuid
+        and not self.pendingBackstoryGuid then
+        return
+    end
+    -- Replies are ignored while an upload is open, and a
+    -- request sent now would only crowd the paced upload
+    -- towards chat flood protection. UPDATED restarts the
+    -- polls with a fresh clock once the save is confirmed.
+    if self.uploadState then
         return
     end
 
-    self.tonePollElapsed = self.tonePollElapsed + elapsed
-    self.tonePollRemaining = self.tonePollRemaining - elapsed
+    if self.pendingToneGuid then
+        self.tonePollRemaining = self.tonePollRemaining - elapsed
+        if self.tonePollRemaining <= 0 then
+            self:SetStatus(
+                "Tone generation is still pending. Use Refresh.",
+                1, 0.82, 0
+            )
+            self:StopTonePoll()
+        end
+    end
 
-    if self.tonePollRemaining <= 0 then
-        self:SetStatus(
-            "Tone generation is still pending. Use Refresh.",
-            1, 0.82, 0
-        )
-        self:StopTonePoll()
+    if self.pendingBackstoryGuid then
+        self.backstoryPollRemaining =
+            self.backstoryPollRemaining - elapsed
+        if self.backstoryPollRemaining <= 0 then
+            self:SetStatus(
+                "Backstory generation still pending."
+                .. " Use Refresh.",
+                1, 0.82, 0
+            )
+            self:StopBackstoryPoll()
+        end
+    end
+
+    local guid = self.pendingToneGuid or self.pendingBackstoryGuid
+    if not guid then
         return
     end
 
-    if self.tonePollElapsed >= 1.5 then
-        self.tonePollElapsed = 0
-        self:SendCommand("get " .. self.pendingToneGuid)
+    self.pollElapsed = self.pollElapsed + elapsed
+    if self.pollElapsed < POLL_INTERVAL then
+        return
+    end
+
+    self.pollElapsed = 0
+    self:SendCommand("get " .. guid)
+    if self.pendingBackstoryGuid
+        and self.pendingBackstoryGuid ~= guid then
+        self:SendCommand("get " .. self.pendingBackstoryGuid)
     end
 end
 
@@ -353,15 +591,20 @@ function Chatter:UpdateSaveButton()
         return
     end
 
-    local loaded = self.loadedTraits
-    if not loaded or self.pendingProfileGuid or self.forgetQueue then
+    if self.pendingProfileGuid or self.forgetQueue then
         self:SetSaveEnabled(false)
         return
     end
+    self:SetSaveEnabled(self:TraitsEdited())
+end
+
+-- True when the trait boxes hold something other than the
+-- traits last loaded from the server.
+function Chatter:TraitsEdited()
+    local loaded = self.loadedTraits
     local p = self:GetActivePanel()
-    if not p then
-        self:SetSaveEnabled(false)
-        return
+    if not loaded or not p then
+        return false
     end
     local t1 = sanitizeInput(
         p.trait1 and p.trait1:GetText() or ""
@@ -372,19 +615,18 @@ function Chatter:UpdateSaveButton()
     local t3 = sanitizeInput(
         p.trait3 and p.trait3:GetText() or ""
     )
-    local changed = (
+    return (
         t1 ~= (loaded.trait1 or "")
         or t2 ~= (loaded.trait2 or "")
         or t3 ~= (loaded.trait3 or "")
     )
-    self:SetSaveEnabled(changed)
 end
 
 function Chatter:StopBackstoryPoll()
     self.pendingBackstoryGuid = nil
-    self.backstoryPollElapsed = 0
     self.backstoryPollRemaining = 0
     self:SetRegenStoryEnabled(true)
+    self:UpdateStoryControls()
 end
 
 function Chatter:StartBackstoryPoll(guid)
@@ -393,57 +635,31 @@ function Chatter:StartBackstoryPoll(guid)
         return
     end
 
+    -- The story on record when the wait begins is the one
+    -- being replaced. A reply already on its way can still
+    -- carry it, and must not be taken for the new story.
+    if self.pendingBackstoryGuid ~= guid then
+        local before = nil
+        if guid == self.selectedGuid then
+            before = self.loadedBackstory
+        end
+        self.replacedStory = (before and before ~= "") and before
+            or nil
+    end
     self.pendingBackstoryGuid = guid
-    self.backstoryPollElapsed = 0
-    self.backstoryPollRemaining = 120
+    self.pollElapsed = 0
+    self.backstoryPollRemaining = POLL_TIMEOUT
 
     self:SetRegenStoryEnabled(false)
 
-    -- Show placeholder in the backstory box
-    local placeholder = "Creating background story..."
-    if self.frame and self.frame.backstory then
-        self.frame.backstory:SetText(placeholder)
-        self.frame.backstory:SetTextColor(
-            0.5, 0.5, 0.5
+    -- Show the placeholder, unless the boxes hold a story
+    -- the player is still editing.
+    if not self:GetStoryEdit() then
+        self:ShowStory(
+            "Creating background story...", 0.5, 0.5, 0.5
         )
     end
-    if self.storiesPanel
-        and self.storiesPanel.backstory then
-        self.storiesPanel.backstory:SetText(
-            placeholder
-        )
-        self.storiesPanel.backstory:SetTextColor(
-            0.5, 0.5, 0.5
-        )
-    end
-end
-
-function Chatter:HandleBackstoryPoll(elapsed)
-    if not self.pendingBackstoryGuid then
-        return
-    end
-
-    self.backstoryPollElapsed =
-        self.backstoryPollElapsed + elapsed
-    self.backstoryPollRemaining =
-        self.backstoryPollRemaining - elapsed
-
-    if self.backstoryPollRemaining <= 0 then
-        self:SetStatus(
-            "Backstory generation still pending."
-            .. " Use Refresh.",
-            1, 0.82, 0
-        )
-        self:StopBackstoryPoll()
-        return
-    end
-
-    if self.backstoryPollElapsed >= 2.0 then
-        self.backstoryPollElapsed = 0
-        self:SendCommand(
-            "get " .. self.pendingBackstoryGuid
-        )
-    end
+    self:UpdateStoryControls()
 end
 
 function Chatter:SaveWindowPosition()
@@ -482,7 +698,9 @@ end
 -- `keepTraits` leaves the three trait boxes alone while still
 -- refreshing tone and backstory, for profiles that arrive
 -- when the player has edits the server has not accepted yet.
-function Chatter:ApplyProfileToPanel(p, profile, keepTraits)
+-- `keepStory` leaves the story box alone: a PROFILE line never
+-- carries the story, which arrives on its own BACKSTORY line.
+function Chatter:ApplyProfileToPanel(p, profile, keepTraits, keepStory)
     if not p then
         return
     end
@@ -508,7 +726,7 @@ function Chatter:ApplyProfileToPanel(p, profile, keepTraits)
             p.tone:SetTextColor(0.7, 0.7, 0.7)
         end
     end
-    if p.backstory then
+    if p.backstory and not keepStory then
         local bsText = profile.backstory or ""
         -- Only overwrite if not currently showing
         -- a live placeholder (poll in progress)
@@ -541,6 +759,18 @@ function Chatter:ApplyProfile(profile)
         self.unsavedTraits ~= nil
         and self.unsavedTraits.guid == profile.guid
     )
+    -- The same goes for an edit that has not been saved at
+    -- all: a poll reply, or any other repeat of a profile that
+    -- is already loaded, must not wipe what is being typed.
+    -- Only a fresh selection (pendingProfileGuid) starts the
+    -- boxes over.
+    if not self.pendingProfileGuid and self:TraitsEdited() then
+        keepTraits = true
+    end
+    -- Only a profile that was asked for by selecting the bot
+    -- announces itself; a repeat must not talk over the
+    -- message of whatever caused it ("Story saved", say).
+    local fresh = (self.pendingProfileGuid ~= nil)
     self.pendingProfileGuid = nil
     self:SetRegenStoryEnabled(not self.pendingBackstoryGuid)
     local awaitingTone = (
@@ -555,13 +785,16 @@ function Chatter:ApplyProfile(profile)
         trait3 = profile.trait3 or "",
     }
 
-    self:ApplyProfileToPanel(self.frame, profile, keepTraits)
     self:ApplyProfileToPanel(
-        self.traitsPanel, profile, keepTraits
+        self.frame, profile, keepTraits, true
     )
     self:ApplyProfileToPanel(
-        self.storiesPanel, profile, keepTraits
+        self.traitsPanel, profile, keepTraits, true
     )
+    self:ApplyProfileToPanel(
+        self.storiesPanel, profile, keepTraits, true
+    )
+    self:UpdateStoryControls()
 
     if keepTraits then
         -- The boxes still hold an edit the server never took,
@@ -589,7 +822,7 @@ function Chatter:ApplyProfile(profile)
                 "Generating tone...", 1, 0.82, 0
             )
         end
-    else
+    elseif fresh then
         self:SetStatus(
             "Loaded " .. (profile.name or "bot"),
             0.3, 1, 0.3
@@ -597,7 +830,10 @@ function Chatter:ApplyProfile(profile)
     end
 end
 
-function Chatter:SelectBot(guid)
+-- `keepStory` is for a selection the player did not make: the
+-- roster coming back with the same bot still selected. A
+-- story being typed for that bot stays.
+function Chatter:SelectBot(guid, keepStory)
     if self.forgetQueue then return end
     guid = tonumber(guid)
     if not guid then
@@ -621,17 +857,35 @@ function Chatter:SelectBot(guid)
     if self.uploadGuid and self.uploadGuid ~= guid then
         self:AbortUpload()
     end
+    -- Picking a bot starts its story over from what the server
+    -- holds, except for a story that is on its way up to that
+    -- very bot right now.
+    if self.storyEdit and self.storyEdit.guid ~= guid then
+        self.storyEdit = nil
+    elseif not keepStory
+        and not (self.uploadState and self.uploadGuid == guid) then
+        self.storyEdit = nil
+    end
 
     self.selectedGuid = guid
     self.pendingProfileGuid = guid
     self.loadedTraits = nil
+    self.loadedBackstory = nil
     self:SetSaveEnabled(false)
     self:SetRegenStoryEnabled(false)
     local empty = {trait1 = "", trait2 = "", trait3 = "",
         tone = "", backstory = ""}
-    self:ApplyProfileToPanel(self.frame, empty)
-    self:ApplyProfileToPanel(self.traitsPanel, empty)
-    self:ApplyProfileToPanel(self.storiesPanel, empty)
+    -- A story edit that survives the selection keeps its text
+    -- in the boxes while the profile reloads.
+    local keptStory = (self:GetStoryEdit() ~= nil)
+    self:ApplyProfileToPanel(self.frame, empty, false, keptStory)
+    self:ApplyProfileToPanel(
+        self.traitsPanel, empty, false, keptStory
+    )
+    self:ApplyProfileToPanel(
+        self.storiesPanel, empty, false, keptStory
+    )
+    self:UpdateStoryControls()
     self:UpdateRosterViews()
     self:SetStatus("Loading bot profile...", 1, 0.82, 0)
     self:SendCommand("get " .. guid)
@@ -647,7 +901,10 @@ function Chatter:RequestRoster()
 end
 
 function Chatter:SaveProfile()
-    if self.pendingProfileGuid or self.forgetQueue then return end
+    if self.pendingProfileGuid or self.forgetQueue
+        or self.uploadState then
+        return
+    end
     if not self.selectedGuid then
         self:SetStatus("Select a bot first.", 1, 0.2, 0.2)
         return
@@ -742,7 +999,8 @@ end
 function Chatter:DoSaveProfile()
     local t = self.pendingTraits
     if not t or t.guid ~= self.selectedGuid
-        or self.pendingProfileGuid or self.forgetQueue then
+        or self.pendingProfileGuid or self.forgetQueue
+        or self.uploadState then
         return
     end
 
@@ -750,6 +1008,10 @@ function Chatter:DoSaveProfile()
     self:StopTonePoll()
     self:StopBackstoryPoll()
     self:FlushSendQueue()
+    -- Changed traits queue a story generation. Held from the
+    -- moment of sending: the commit can land even if its
+    -- confirmation never reaches the addon.
+    self:HoldStorySave(guid)
 
     local line = string.format(
         "set %d %s %s %s",
@@ -773,12 +1035,14 @@ function Chatter:DoSaveProfile()
     if string.len(".llmc " .. line) <= MAX_CHAT_LENGTH then
         self.uploadGuid = guid
         self.uploadState = "sending"
+        self.uploadKind = "traits"
         self:SendCommand(line)
         self:LockSave()
         -- A single line is already gone, so the wait for the
         -- answer starts immediately.
         self:BeginConfirmWait()
     elseif self:QueueChunkedSave(guid, t) then
+        self.uploadKind = "traits"
         self:LockSave()
     else
         self.unsavedTraits = nil
@@ -813,15 +1077,123 @@ function Chatter:GetSelectedName()
     return nil
 end
 
+-- Validates the typed story and sends it. Nothing else is
+-- regenerated by a story save, so it asks no confirmation.
+function Chatter:SaveStory()
+    if self.pendingProfileGuid or self.forgetQueue
+        or self.uploadState then
+        return
+    end
+    if not self.selectedGuid or not self.loadedTraits then
+        self:SetStatus("Select a bot first.", 1, 0.2, 0.2)
+        return
+    end
+    if self.pendingBackstoryGuid
+        or self.storyHolds[self.selectedGuid] then
+        self:SetStatus(
+            "The server may still be writing a story for this"
+                .. " bot. Save yours in a moment.",
+            1, 0.82, 0
+        )
+        return
+    end
+
+    local edit = self:GetStoryEdit()
+    local text = sanitizeInput(edit and edit.text or "")
+    if not edit or text == (self.loadedBackstory or "") then
+        self.storyEdit = nil
+        self:UpdateStoryControls()
+        self:SetStatus("Story unchanged.", 0.3, 1, 0.3)
+        return
+    end
+    if text == "" then
+        self:SetStatus(
+            "The story cannot be empty. Use Regenerate Story"
+                .. " for a new one.",
+            1, 0.2, 0.2
+        )
+        return
+    end
+    if utf8len(text) > MAX_STORY_CHARS then
+        self:SetStatus(
+            "The story must stay within " .. MAX_STORY_CHARS
+                .. " characters (now " .. utf8len(text) .. ").",
+            1, 0.2, 0.2
+        )
+        return
+    end
+
+    local guid = self.selectedGuid
+    local encoded = self:Encode(text)
+    local line = string.format("setbackstory %d %s", guid, encoded)
+
+    self:FlushSendQueue()
+    if string.len(".llmc " .. line) <= MAX_CHAT_LENGTH then
+        self.uploadGuid = guid
+        self.uploadState = "sending"
+        self.uploadKind = "story"
+        self.uploadStory = text
+        self:SendCommand(line)
+        self:LockSave()
+        self:BeginConfirmWait()
+    else
+        local chunks = self:SplitEncoded(encoded, CHUNK_BUDGET)
+        if not chunks or #chunks > MAX_CHUNKS then
+            self:SetStatus(
+                "Could not send this story.", 1, 0.2, 0.2
+            )
+            return
+        end
+        for i = 1, #chunks do
+            self:QueueCommand(string.format(
+                "put %d bs %d %d %s", guid, i, #chunks, chunks[i]
+            ))
+        end
+        self:QueueCommand(string.format("commit %d", guid))
+        self.uploadGuid = guid
+        self.uploadState = "sending"
+        self.uploadKind = "story"
+        self.uploadStory = text
+        self:LockSave()
+    end
+    self:SetStatus("Saving story...", 1, 0.82, 0)
+end
+
 function Chatter:RegenBackstory()
-    if self.pendingProfileGuid or self.forgetQueue then return end
+    if self.pendingProfileGuid or self.forgetQueue
+        or self.uploadState then
+        return
+    end
     if not self.selectedGuid then
         self:SetStatus("Select a bot first.", 1, 0.2, 0.2)
         return
     end
 
-    local guid = self.selectedGuid
+    -- A new story replaces the one being edited, so that is
+    -- the player's call to make.
+    if self:GetStoryEdit() then
+        -- The dialog owns the bot it asked about: picking
+        -- another bot while it is open cannot retarget it.
+        local popup = StaticPopup_Show(
+            "CHATTER_CONFIRM_REGEN_STORY"
+        )
+        if popup then popup.data = self.selectedGuid end
+        return
+    end
+    self:DoRegenBackstory(self.selectedGuid)
+end
+
+function Chatter:DoRegenBackstory(guid)
+    guid = tonumber(guid)
+    if not guid or guid ~= self.selectedGuid
+        or self.pendingProfileGuid or self.forgetQueue
+        or self.uploadState then
+        return
+    end
+
+    self.storyEdit = nil
     self:StopBackstoryPoll()
+    self:HoldStorySave(guid)
     self:SendCommand("regenbackstory " .. guid)
     self:StartBackstoryPoll(guid)
     self:SetStatus(
@@ -869,6 +1241,8 @@ function Chatter:FinishRoster()
         self.selectedGuid = nil
         self.pendingProfileGuid = nil
         self.loadedTraits = nil
+        self.loadedBackstory = nil
+        self.storyEdit = nil
         ChatterDB.selectedGuid = nil
         self:StopTonePoll()
         self:StopBackstoryPoll()
@@ -903,7 +1277,9 @@ function Chatter:FinishRoster()
         found = self.roster[1].guid
     end
 
-    self:SelectBot(found)
+    -- The roster returning with the same bot is not the player
+    -- choosing it again.
+    self:SelectBot(found, found == self.selectedGuid)
 end
 
 function Chatter:HandleProfilePayload(rest)
@@ -940,29 +1316,68 @@ function Chatter:HandleBackstoryPayload(rest)
     local numGuid = tonumber(guid)
     local text = self:Decode(encoded or "-")
 
-    -- Stale while an upload is still open: this is the story
-    -- the save is about to replace or regenerate.
     if self.uploadState and self.uploadGuid == numGuid then
+        if self.uploadKind ~= "story"
+            or text ~= self.uploadStory then
+            -- Stale while an upload is still open: the story
+            -- a trait save is about to regenerate, or the
+            -- text of an earlier story save, not this one.
+            return
+        end
+        -- The server holds exactly the story that was sent.
+        -- Only now is the upload over.
+        self:FlushSendQueue()
+        self.uploadGuid = nil
+        self.uploadState = nil
+        self.uploadKind = nil
+        self.uploadStory = nil
+        if self.storyEdit and self.storyEdit.guid == numGuid then
+            self.storyEdit = nil
+        end
+        self:UnlockSave()
+        if self.selectedGuid == numGuid then
+            self.loadedBackstory = text
+            self:ShowStory(text)
+            self:SetStatus(
+                "Story saved for "
+                    .. (self:GetSelectedName() or "bot") .. ".",
+                0.3, 1, 0.3
+            )
+        end
+        self:UpdateStoryControls()
         return
     end
 
-    -- Only apply non-empty backstory to boxes;
-    -- empty means still generating — preserve
-    -- the "Creating background story..." placeholder
-    if text and text ~= ""
-        and self.selectedGuid == numGuid then
-        if self.frame and self.frame.backstory then
-            self.frame.backstory:SetText(text)
-            self.frame.backstory:SetTextColor(
-                0.7, 0.7, 0.7
-            )
+    local polling = (self.pendingBackstoryGuid == numGuid)
+
+    -- Still the story that is being replaced: a reply to a
+    -- request made before the generation was asked for.
+    if polling and text ~= "" and text == self.replacedStory then
+        return
+    end
+
+    -- A story other than the one that was being replaced means
+    -- the generation has run, whenever it is seen, so nothing
+    -- is left that could clear a saved story.
+    local hold = self.storyHolds[numGuid]
+    if hold and text ~= "" and text ~= hold.replaced then
+        self.storyHolds[numGuid] = nil
+    end
+
+    if self.selectedGuid == numGuid then
+        self.loadedBackstory = text
+        -- An edit the server now holds word for word is not
+        -- an edit any more (a save confirmed late, say).
+        local edit = self:GetStoryEdit()
+        if edit and sanitizeInput(edit.text) == text then
+            self.storyEdit = nil
+            edit = nil
         end
-        if self.storiesPanel
-            and self.storiesPanel.backstory then
-            self.storiesPanel.backstory:SetText(text)
-            self.storiesPanel.backstory:SetTextColor(
-                0.7, 0.7, 0.7
-            )
+        -- The boxes follow the server unless the player is
+        -- editing. An empty story during generation leaves the
+        -- "Creating background story..." placeholder up.
+        if not edit and (text ~= "" or not polling) then
+            self:ShowStory(text)
         end
     end
 
@@ -981,6 +1396,7 @@ function Chatter:HandleBackstoryPayload(rest)
             end
         end
     end
+    self:UpdateStoryControls()
 end
 
 function Chatter:HandleSystemMessage(message)
@@ -1020,24 +1436,55 @@ function Chatter:HandleSystemMessage(message)
     end
 
     if command == "UPDATED" then
-        local guid, name, flag = string.match(
-            rest, "^(%d+)%s+(%S+)%s+(%S+)"
+        local guid, name, flag, extra = string.match(
+            rest, "^(%d+)%s+(%S+)%s+(%S+)%s*(%S*)"
         )
+        -- "nostory": stories are switched off on the server, so
+        -- the changed traits regenerate the tone only.
+        local noStory = (extra == "nostory")
         if guid and name and tonumber(guid) == self.selectedGuid
             and not self.forgetQueue then
+            if self.uploadState and self.uploadKind == "story" then
+                -- A trait save that was given up on has been
+                -- applied after all. The story upload now in
+                -- flight is not its business; only the story
+                -- generation those traits queued is noted.
+                if flag == "changed" and not noStory then
+                    self:HoldStorySave(guid)
+                end
+                return
+            end
             self.selectedGuid = tonumber(guid)
             -- The server applied the edit. Only now is the
             -- upload over and the typed text the saved text.
             self:FlushSendQueue()
             self.uploadGuid = nil
             self.uploadState = nil
+            self.uploadKind = nil
             self.unsavedTraits = nil
             self:UnlockSave()
             local changed = (flag == "changed")
-            if changed then
+            if changed and noStory then
+                -- No story is coming. The new traits cleared
+                -- the old one, so the box shows what the
+                -- server holds: nothing, unless the player is
+                -- writing one, which can be saved right away.
+                self:StartTonePoll(guid)
+                self:StopBackstoryPoll()
+                self.storyHolds[tonumber(guid)] = nil
+                self.loadedBackstory = ""
+                if not self:GetStoryEdit() then
+                    self:ShowStory("")
+                end
+                self:UpdateStoryControls()
+                self:SetStatus(
+                    "Saved. Regenerating tone...", 1, 0.82, 0
+                )
+            elseif changed then
                 -- Polls were started in DoSaveProfile;
                 -- restart here to reset the 120s clock
                 -- now that the server confirmed the save
+                self:HoldStorySave(guid)
                 self:StartTonePoll(guid)
                 self:StartBackstoryPoll(guid)
                 self:SetStatus(
@@ -1060,6 +1507,15 @@ function Chatter:HandleSystemMessage(message)
                 )
             end
         end
+        return
+    end
+
+    if command == "BACKSTORY_SAVED" then
+        -- Says that a story was stored, not which one: it
+        -- names no text, so it cannot tell the save in flight
+        -- from an earlier one that was given up on and landed
+        -- late. The BACKSTORY line that follows carries the
+        -- stored text, and that is what settles a save.
         return
     end
 
@@ -1089,7 +1545,7 @@ function Chatter:HandleSystemMessage(message)
             return
         end
         self.pendingRoster = nil
-        local _, encoded = string.match(
+        local category, encoded = string.match(
             rest, "^(%S+)%s*(.-)$"
         )
         local text = self:Decode(encoded)
@@ -1099,6 +1555,30 @@ function Chatter:HandleSystemMessage(message)
             -- — with the player's traits handed back.
             self:AbortUpload(text, 1, 0.2, 0.2)
         else
+            -- Whatever was being loaded or awaited will not
+            -- arrive: a poll left running would repeat the
+            -- same refused request for two minutes, and a
+            -- profile load left pending would never finish.
+            local awaitedStory = self.pendingBackstoryGuid
+            self:StopTonePoll()
+            self:StopBackstoryPoll()
+            self.pendingProfileGuid = nil
+            if awaitedStory then
+                -- "disabled" means the server queued nothing,
+                -- so there is no generation left that a saved
+                -- story would have to wait for.
+                if category == "disabled" then
+                    self.storyHolds[awaitedStory] = nil
+                end
+                -- The story that was being waited for is not
+                -- coming; put back the one on record instead
+                -- of leaving the placeholder up.
+                if awaitedStory == self.selectedGuid
+                    and not self:GetStoryEdit() then
+                    self:ShowStory(self.loadedBackstory or "")
+                end
+            end
+            self:SetRegenStoryEnabled(self.loadedTraits ~= nil)
             self:UnlockSave()
             self:SetStatus(text, 1, 0.2, 0.2)
         end
@@ -1126,6 +1606,19 @@ StaticPopupDialogs["CHATTER_CONFIRM_SAVE_TRAITS"] = {
     preferredIndex = 3,
 }
 
+StaticPopupDialogs["CHATTER_CONFIRM_REGEN_STORY"] = {
+    text = "You have an unsaved story for this bot. Regenerating will replace it with a newly written one. Continue?",
+    button1 = "Regenerate",
+    button2 = "Cancel",
+    OnAccept = function(self)
+        Chatter:DoRegenBackstory(self.data)
+    end,
+    timeout = 0,
+    whileDead = false,
+    hideOnEscape = true,
+    preferredIndex = 3,
+}
+
 SLASH_CHATTER1 = "/chatter"
 SLASH_CHATTER2 = "/llmc"
 SlashCmdList["CHATTER"] = function()
@@ -1144,8 +1637,8 @@ Chatter:SetScript("OnUpdate", function(self, elapsed)
         end
     end
     self:HandleForgetQueue(elapsed)
-    self:HandleTonePoll(elapsed)
-    self:HandleBackstoryPoll(elapsed)
+    self:HandlePolls(elapsed)
+    self:HandleStoryHolds(elapsed)
 end)
 
 Chatter:SetScript("OnEvent", function(self, event, message)

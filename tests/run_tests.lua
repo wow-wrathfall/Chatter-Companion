@@ -17,6 +17,8 @@ package.path = here .. "/?.lua;" .. package.path
 
 local suites = {
     "test_upload_lifecycle",
+    "test_polling",
+    "test_story_edit",
     "test_encoding",
 }
 

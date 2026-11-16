@@ -56,6 +56,17 @@ function Chatter:StartForgetBatch(targets)
     -- Bots are about to be erased, so an unfinished save for
     -- one of them has nothing left to save to.
     self.unsavedTraits = nil
+    -- A story being typed goes only with its own bot. For any
+    -- other bot it has nothing to do with this deletion and
+    -- stays, through the roster refresh that follows.
+    if self.storyEdit then
+        for _, guid in ipairs(targets) do
+            if guid == self.storyEdit.guid then
+                self.storyEdit = nil
+                break
+            end
+        end
+    end
     if self.uploadGuid then self:AbortUpload() end
     self:StopTonePoll()
     self:StopBackstoryPoll()
@@ -68,6 +79,7 @@ function Chatter:StartForgetBatch(targets)
     self.forgetDone = 0
     self.forgetElapsed = 0
     self.forgetWaiting = nil
+    self:UpdateStoryControls()
     self:UpdateRosterViews()
     self:SetStatus("Forgetting selected bots...", 1, 0.82, 0)
 end
@@ -101,9 +113,12 @@ function Chatter:HandleForgotten(guid)
         self.loadedTraits = nil
         self.pendingProfileGuid = nil
         self.unsavedTraits = nil
+        self.loadedBackstory = nil
+        self.storyEdit = nil
         self:ApplyProfileToPanel(self.frame, {})
         self:ApplyProfileToPanel(self.traitsPanel, {})
         self:ApplyProfileToPanel(self.storiesPanel, {})
+        self:UpdateStoryControls()
     end
     if not self.forgetQueue then
         self:RequestRoster()

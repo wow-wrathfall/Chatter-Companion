@@ -329,8 +329,9 @@ tests["the timeout does not fire while the queue drains"] = function()
 end
 
 -- Sending the commit is not the same as having it applied.
--- A tone poll fires every 1.5s during a save, and its reply
--- describes the bot as it was before the save.
+-- A reply to a request made just before the save can still
+-- arrive during it, and it describes the bot as it was before
+-- the save.
 tests["a reply during the wait cannot revert the boxes"] = function()
     local C = loadedBot()
     local edited = startChunkedSave(C)
